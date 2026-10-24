@@ -168,15 +168,23 @@ impl ProviderInner {
         }
     }
 
-    /// Attaches the built in virtual UVC camera to the hub.
+    /// Attaches one built in virtual UVC camera per requested host camera.
     fn attach_virtual_camera(&self) -> Result<()> {
-        let camera = uvc_backend::uvc_device::attach_virtual_camera(
-            DeviceState::new(self.fail_handle.clone(), self.job_queue.clone()),
-            self.event_loop.clone(),
-        )?;
-        match self.usb_hub.connect_backend(camera) {
-            Ok(port) => info!("usb: virtual UVC camera attached to port {}", port),
-            Err(e) => error!("failed to connect the virtual UVC camera: {}", e),
+        let cameras = uvc_camera_index_list();
+        let slots = cameras.len().min(uvc_backend::camera::CAMERA_SLOTS);
+        for (slot, camera_id) in cameras.into_iter().take(slots).enumerate() {
+            let camera = uvc_backend::uvc_device::attach_virtual_camera(
+                DeviceState::new(self.fail_handle.clone(), self.job_queue.clone()),
+                self.event_loop.clone(),
+                slot,
+                camera_id.clone(),
+            )?;
+            match self.usb_hub.connect_backend(camera) {
+                Ok(port) => info!(
+                    "usb: virtual UVC camera {slot} (host camera {camera_id}) on port {port}"
+                ),
+                Err(e) => error!("failed to connect the virtual UVC camera {slot}: {e}"),
+            }
         }
         Ok(())
     }
@@ -335,6 +343,40 @@ impl ProviderInner {
         };
         tube.send(&result).map_err(Error::WriteControlTube)?;
         Ok(())
+    }
+}
+
+/// Cameras requested on the command line, one per `--uvc-camera`. Written once
+/// before the VM starts, and the authority when present: it is per VM, which the
+/// file below is not.
+static UVC_CAMERAS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+/// Records the cameras the VM asked for. An empty list leaves the default alone.
+pub fn set_uvc_cameras(cameras: Vec<String>) {
+    let _ = UVC_CAMERAS.set(cameras);
+}
+
+/// Host camera indexes to expose, one per `--uvc-camera` of this VM, else one per
+/// line of `/data/local/tmp/droidvm-uvc-cameras`. Without either the VM gets the
+/// back camera only, which is what every VM had before two cameras existed.
+fn uvc_camera_index_list() -> Vec<String> {
+    if let Some(list) = UVC_CAMERAS.get() {
+        if !list.is_empty() {
+            return list.clone();
+        }
+    }
+    const PATH: &str = "/data/local/tmp/droidvm-uvc-cameras";
+    let raw = std::fs::read_to_string(PATH).unwrap_or_default();
+    let list: Vec<String> = raw
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_string)
+        .collect();
+    if list.is_empty() {
+        vec!["0".to_string()]
+    } else {
+        list
     }
 }
 

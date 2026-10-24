@@ -79,24 +79,30 @@ pub const TEST_PATTERN: &[u8] = include_bytes!("test_pattern.jpg");
 
 /// USB device descriptor. All string indexes are zero: the device carries no
 /// strings, which keeps enumeration simple.
-pub const DEVICE_DESCRIPTOR: [u8; 18] = [
-    18,   // bLength
-    0x01, // bDescriptorType = DEVICE
-    0x00, 0x02, // bcdUSB = 2.00
-    0xef, // bDeviceClass = Miscellaneous
-    0x02, // bDeviceSubClass = Common Class
-    0x01, // bDeviceProtocol = Interface Association Descriptor
-    64,   // bMaxPacketSize0
-    (VENDOR_ID & 0xff) as u8,
-    (VENDOR_ID >> 8) as u8,
-    (PRODUCT_ID & 0xff) as u8,
-    (PRODUCT_ID >> 8) as u8,
-    0x00, 0x01, // bcdDevice = 1.00
-    0,    // iManufacturer
-    0,    // iProduct
-    0,    // iSerialNumber
-    1,    // bNumConfigurations
-];
+///
+/// The bcdDevice minor version carries the camera slot, so a VM that exposes two
+/// cameras yields two devices the guest can tell apart instead of two bit
+/// identical ones.
+pub const fn device_descriptor(slot: usize) -> [u8; 18] {
+    [
+        18,   // bLength
+        0x01, // bDescriptorType = DEVICE
+        0x00, 0x02, // bcdUSB = 2.00
+        0xef, // bDeviceClass = Miscellaneous
+        0x02, // bDeviceSubClass = Common Class
+        0x01, // bDeviceProtocol = Interface Association Descriptor
+        64,   // bMaxPacketSize0
+        (VENDOR_ID & 0xff) as u8,
+        (VENDOR_ID >> 8) as u8,
+        (PRODUCT_ID & 0xff) as u8,
+        (PRODUCT_ID >> 8) as u8,
+        (slot & 0x3f) as u8, 0x01, // bcdDevice = 1.<slot>
+        0,    // iManufacturer
+        0,    // iProduct
+        0,    // iSerialNumber
+        1,    // bNumConfigurations
+    ]
+}
 
 /// Builds the UVC 1.1 probe/commit structure with the current defaults.
 pub fn default_probe() -> [u8; PROBE_LEN] {

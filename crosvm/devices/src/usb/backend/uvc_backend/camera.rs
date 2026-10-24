@@ -568,29 +568,42 @@ const JPEG_QUALITY: u8 = 75;
 const CAPTURE_WIDTH: c_int = 1920;
 const CAPTURE_HEIGHT: c_int = 1080;
 
-/// Newest JPEG frame produced by the capture loop.
-static LATEST_FRAME: std::sync::Mutex<Option<Vec<u8>>> = std::sync::Mutex::new(None);
+/// How many host cameras one VM can expose as UVC devices.
+pub const CAMERA_SLOTS: usize = 2;
+
+/// Newest JPEG frame produced by each capture loop.
+static LATEST_FRAME: [std::sync::Mutex<Option<Vec<u8>>>; CAMERA_SLOTS] =
+    [const { std::sync::Mutex::new(None) }; CAMERA_SLOTS];
 /// Counter that grows with every captured frame, so that the UVC device can tell
 /// a new picture from the one it already handed to the guest.
-static FRAME_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FRAME_SEQ: [std::sync::atomic::AtomicU64; CAMERA_SLOTS] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; CAMERA_SLOTS];
 
-/// Returns a copy of the newest camera frame together with its sequence number.
-pub fn take_latest_frame() -> Option<(u64, Vec<u8>)> {
-    let mut slot = LATEST_FRAME.lock().ok()?;
+/// Clamps a slot index coming from outside this module.
+fn camera_slot_of(camera_slot: usize) -> usize {
+    camera_slot.min(CAMERA_SLOTS - 1)
+}
+
+/// Returns a copy of the newest frame of `camera_slot` with its sequence number.
+pub fn take_latest_frame(camera_slot: usize) -> Option<(u64, Vec<u8>)> {
+    let index = camera_slot_of(camera_slot);
+    let mut slot = LATEST_FRAME[index].lock().ok()?;
     let frame = slot.clone()?;
-    let seq = FRAME_SEQ.load(std::sync::atomic::Ordering::Relaxed);
+    let seq = FRAME_SEQ[index].load(std::sync::atomic::Ordering::Relaxed);
     Some((seq, frame))
 }
 
-fn store_frame(frame: Vec<u8>) {
-    if let Ok(mut slot) = LATEST_FRAME.lock() {
+fn store_frame(camera_slot: usize, frame: Vec<u8>) {
+    let index = camera_slot_of(camera_slot);
+    if let Ok(mut slot) = LATEST_FRAME[index].lock() {
         *slot = Some(frame);
-        FRAME_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        FRAME_SEQ[index].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
-fn clear_frame() {
-    if let Ok(mut slot) = LATEST_FRAME.lock() {
+fn clear_frame(camera_slot: usize) {
+    let index = camera_slot_of(camera_slot);
+    if let Ok(mut slot) = LATEST_FRAME[index].lock() {
         *slot = None;
     }
 }
@@ -598,34 +611,39 @@ fn clear_frame() {
 /// Whether the guest asked for video (UVC commit control) and is still pulling
 /// frames. The camera stays closed unless both are true, so the phone keeps the
 /// camera to itself while Windows is not using it.
-static STREAM_WANTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static STREAM_WANTED: [std::sync::atomic::AtomicBool; CAMERA_SLOTS] =
+    [const { std::sync::atomic::AtomicBool::new(false) }; CAMERA_SLOTS];
 /// Last time the guest requested a frame from the bulk endpoint.
-static LAST_ACTIVITY: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+static LAST_ACTIVITY: [std::sync::Mutex<Option<std::time::Instant>>; CAMERA_SLOTS] =
+    [const { std::sync::Mutex::new(None) }; CAMERA_SLOTS];
 
 /// Called by the UVC device when the guest starts or stops streaming.
-pub fn set_streaming(on: bool) {
+pub fn set_streaming(camera_slot: usize, on: bool) {
     use std::sync::atomic::Ordering;
-    STREAM_WANTED.store(on, Ordering::Relaxed);
+    let index = camera_slot_of(camera_slot);
+    STREAM_WANTED[index].store(on, Ordering::Relaxed);
     if on {
-        touch_activity();
+        touch_activity(camera_slot);
     } else {
-        append_log("capture: guest stopped streaming");
+        append_log(&format!("capture: camera {camera_slot} stopped streaming"));
     }
 }
 
 /// Called for every bulk IN request so an idle host releases the camera.
-pub fn touch_activity() {
-    if let Ok(mut slot) = LAST_ACTIVITY.lock() {
+pub fn touch_activity(camera_slot: usize) {
+    let index = camera_slot_of(camera_slot);
+    if let Ok(mut slot) = LAST_ACTIVITY[index].lock() {
         *slot = Some(std::time::Instant::now());
     }
 }
 
-fn streaming_wanted() -> bool {
+fn streaming_wanted(camera_slot: usize) -> bool {
     use std::sync::atomic::Ordering;
-    if !STREAM_WANTED.load(Ordering::Relaxed) {
+    let index = camera_slot_of(camera_slot);
+    if !STREAM_WANTED[index].load(Ordering::Relaxed) {
         return false;
     }
-    match LAST_ACTIVITY.lock().ok().and_then(|slot| *slot) {
+    match LAST_ACTIVITY[index].lock().ok().and_then(|slot| *slot) {
         Some(at) => at.elapsed() < std::time::Duration::from_secs(3),
         None => false,
     }
@@ -788,6 +806,7 @@ unsafe fn image_to_jpeg(api: &CameraApi, image: *mut AImage, log_stats: bool) ->
 /// software path available on devices without a usable encoder.
 #[allow(dead_code)]
 fn stream_with_encoder(
+    camera_slot: usize,
     api: &CameraApi,
     device: *mut ACameraDevice,
     mut encoder: crate::usb::backend::uvc_backend::mediacodec::JpegEncoder,
@@ -869,7 +888,7 @@ fn stream_with_encoder(
                 if frames == 0 {
                     append_log(&format!("encoder: first frame jpeg={length} bytes"));
                 }
-                store_frame(jpeg);
+                store_frame(camera_slot, jpeg);
                 frames += 1;
                 idle_since = std::time::Instant::now();
                 if frames % 300 == 0 {
@@ -891,7 +910,7 @@ fn stream_with_encoder(
 /// The camera is only held open while the guest is streaming: as soon as the
 /// guest stops pulling frames, everything is torn down so the phone gets its
 /// camera back.
-fn start_capture() {
+fn start_capture(camera_slot: usize, requested: String) {
     let api = match CameraApi::load() {
         Ok(api) => api,
         Err(e) => {
@@ -920,14 +939,13 @@ fn start_capture() {
             }
         }
         (api.delete_camera_id_list)(id_list);
-        // Which camera to expose: DROIDVM_UVC_CAMERA = "front" | "back" | "<id>".
-        // Android enumerates the back camera first, the front camera usually as
-        // "1"; a literal id always wins so an unusual layout can be pinned.
-        let want = setting("DROIDVM_UVC_CAMERA", "/data/local/tmp/droidvm-uvc-camera")
-            .unwrap_or_else(|| "back".to_string());
-        let want = want.trim().to_ascii_lowercase();
+        // Which camera to expose: the UVC device hands over the id the app
+        // asked for ("0", "1", "front", "back" or a literal Android id). An id
+        // this device does not have falls back to the slot position.
+        let want = requested.trim().to_ascii_lowercase();
         let chosen = match want.as_str() {
-            "" | "back" | "rear" => ids.first().cloned(),
+            "" => ids.get(camera_slot).cloned(),
+            "back" | "rear" => ids.first().cloned(),
             "front" | "selfie" => ids
                 .iter()
                 .find(|id| id.as_str() == "1")
@@ -937,15 +955,16 @@ fn start_capture() {
                 .iter()
                 .find(|id| id.as_str() == other)
                 .cloned()
-                .or_else(|| ids.first().cloned()),
+                .or_else(|| other.parse::<usize>().ok().and_then(|i| ids.get(i).cloned()))
+                .or_else(|| ids.get(camera_slot).cloned()),
         };
         append_log(&format!(
-            "capture: cameras={ids:?} requested={want} chosen={chosen:?}"
+            "capture: camera {camera_slot} cameras={ids:?} requested={want} chosen={chosen:?}"
         ));
         match chosen {
             Some(id) => id,
             None => {
-                append_log("capture: no cameras");
+                append_log(&format!("capture: camera {camera_slot} has no camera to open"));
                 return;
             }
         }
@@ -954,15 +973,15 @@ fn start_capture() {
     append_log("capture: on-demand capture thread ready");
 
     loop {
-        if !streaming_wanted() {
+        if !streaming_wanted(camera_slot) {
             std::thread::sleep(std::time::Duration::from_millis(200));
             continue;
         }
         // SAFETY: the manager outlives every session opened here.
         unsafe {
-            stream_once(&api, manager, camera_id.as_ptr());
+            stream_once(camera_slot, &api, manager, camera_id.as_ptr());
         }
-        clear_frame();
+        clear_frame(camera_slot);
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
 }
@@ -974,7 +993,12 @@ fn start_capture() {
 ///
 /// `manager` must be a live `ACameraManager`, and `camera_id` must be a valid
 /// NUL terminated camera id.
-unsafe fn stream_once(api: &CameraApi, manager: *mut ACameraManager, camera_id: *const c_char) {
+unsafe fn stream_once(
+    camera_slot: usize,
+    api: &CameraApi,
+    manager: *mut ACameraManager,
+    camera_id: *const c_char,
+) {
     let device_callbacks = DeviceStateCallbacks {
         context: std::ptr::null_mut(),
         on_disconnected: None,
@@ -987,7 +1011,7 @@ unsafe fn stream_once(api: &CameraApi, manager: *mut ACameraManager, camera_id: 
         if status == 0 && !device.is_null() {
             break;
         }
-        if !streaming_wanted() {
+        if !streaming_wanted(camera_slot) {
             return;
         }
         std::thread::sleep(std::time::Duration::from_millis(500));
@@ -1184,7 +1208,7 @@ unsafe fn stream_once(api: &CameraApi, manager: *mut ACameraManager, camera_id: 
     let mut stats_bytes = 0u64;
     let mut stats_at = std::time::Instant::now();
     loop {
-        if !streaming_wanted() {
+        if !streaming_wanted(camera_slot) {
             append_log("capture: releasing camera, guest is not streaming");
             break;
         }
@@ -1218,11 +1242,14 @@ unsafe fn stream_once(api: &CameraApi, manager: *mut ACameraManager, camera_id: 
             let size = jpeg.len();
             last_frame = std::time::Instant::now();
             if frames == 1 {
-                if let Err(e) = std::fs::write("/data/local/tmp/frame1.jpg", &jpeg) {
+                if let Err(e) = std::fs::write(
+                    format!("/data/local/tmp/frame1-{camera_slot}.jpg"),
+                    &jpeg,
+                ) {
                     append_log(&format!("capture: cannot dump frame: {e}"));
                 }
             }
-            store_frame(jpeg);
+            store_frame(camera_slot, jpeg);
             stats_frames += 1;
             stats_bytes += size as u64;
             if frames == 1 || frames % 300 == 0 {
@@ -1257,14 +1284,16 @@ unsafe fn stream_once(api: &CameraApi, manager: *mut ACameraManager, camera_id: 
 
 /// Spawns the background thread that streams frames into [`LATEST_FRAME`] while
 /// the guest is streaming. Progress goes to `/data/local/tmp/camprobe.log`.
-pub fn spawn_camera() {
+pub fn spawn_camera(camera_slot: usize, camera_id: String) {
     let _ = std::thread::Builder::new()
-        .name("uvc-camera".to_string())
-        .spawn(|| {
-            let _ = std::fs::write(
-                "/data/local/tmp/camprobe.log",
-                "capture: on-demand camera thread started\n",
-            );
-            start_capture();
+        .name(format!("uvc-camera-{camera_slot}"))
+        .spawn(move || {
+            if camera_slot == 0 {
+                let _ = std::fs::write(
+                    "/data/local/tmp/camprobe.log",
+                    "capture: on-demand camera thread started\n",
+                );
+            }
+            start_capture(camera_slot, camera_id);
         });
 }

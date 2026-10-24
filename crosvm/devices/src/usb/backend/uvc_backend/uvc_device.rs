@@ -129,10 +129,17 @@ pub struct UvcDevice {
     control_transfer_state: Arc<RwLock<ControlTransferState>>,
     transfer_job_queue: Arc<AsyncJobQueue>,
     stream: Arc<Mutex<StreamState>>,
+    /// Which of the VM's cameras this device streams.
+    camera_slot: usize,
 }
 
 impl UvcDevice {
-    pub fn new(state: DeviceState, event_loop: Arc<EventLoop>) -> BackendResult<UvcDevice> {
+    pub fn new(
+        state: DeviceState,
+        event_loop: Arc<EventLoop>,
+        camera_slot: usize,
+        camera_id: String,
+    ) -> BackendResult<UvcDevice> {
         let control_transfer_state = ControlTransferState {
             ctl_ep_state: ControlEndpointState::SetupStage,
             control_request_setup: UsbRequestSetup::new(0, 0, 0, 0, 0),
@@ -144,13 +151,15 @@ impl UvcDevice {
             control_transfer_state: Arc::new(RwLock::new(control_transfer_state)),
             transfer_job_queue: job_queue,
             stream: Arc::new(Mutex::new(StreamState::new())),
+            camera_slot,
         };
         info!(
-            "uvc: camera created, config descriptor {} bytes, frame {} bytes",
+            "uvc: camera {camera_slot} (host camera {camera_id}) created, \
+             config descriptor {} bytes, frame {} bytes",
             descriptors::config_descriptor().len(),
             descriptors::TEST_PATTERN.len()
         );
-        camera::spawn_camera();
+        camera::spawn_camera(camera_slot, camera_id);
         Ok(device)
     }
 
@@ -160,6 +169,7 @@ impl UvcDevice {
     fn handle_control(
         transfer: &mut UvcTransfer,
         stream: &Arc<Mutex<StreamState>>,
+        camera_slot: usize,
     ) -> BackendResult<()> {
         transfer.actual_length = 0;
         let setup = match &transfer.buffer {
@@ -190,7 +200,7 @@ impl UvcDevice {
                 } else {
                     match setup.request {
                         x if x == StandardControlRequest::GetDescriptor as u8 => {
-                            UvcDevice::handle_get_descriptor(&setup, length)
+                            UvcDevice::handle_get_descriptor(&setup, length, camera_slot)
                         }
                         x if x == StandardControlRequest::GetStatus as u8 => {
                             Reply::Data(vec![0u8; 2])
@@ -206,7 +216,14 @@ impl UvcDevice {
                 }
             }
             ControlRequestType::Class => {
-                UvcDevice::handle_class_request(transfer, &setup, length, is_device_to_host, stream)
+                UvcDevice::handle_class_request(
+                    transfer,
+                    &setup,
+                    length,
+                    is_device_to_host,
+                    stream,
+                    camera_slot,
+                )
             }
             _ => Reply::Stall,
         };
@@ -242,13 +259,17 @@ impl UvcDevice {
     /// Handles GET_DESCRIPTOR requests the generic backend layer leaves to the
     /// device driver: device, string, class specific interface and device
     /// qualifier descriptors.
-    fn handle_get_descriptor(setup: &UsbRequestSetup, length: usize) -> Reply {
+    fn handle_get_descriptor(
+        setup: &UsbRequestSetup,
+        length: usize,
+        camera_slot: usize,
+    ) -> Reply {
         let descriptor_type = (setup.value >> 8) as u8;
         let descriptor_index = (setup.value & 0xff) as u8;
         let interface = (setup.index & 0xff) as u8;
         match descriptor_type {
             // DEVICE
-            0x01 => Reply::Data(descriptors::DEVICE_DESCRIPTOR.to_vec()),
+            0x01 => Reply::Data(descriptors::device_descriptor(camera_slot).to_vec()),
             // CONFIGURATION: normally answered by the generic backend layer.
             0x02 => {
                 let config = descriptors::config_descriptor();
@@ -295,6 +316,7 @@ impl UvcDevice {
         length: usize,
         is_device_to_host: bool,
         stream: &Arc<Mutex<StreamState>>,
+        camera_slot: usize,
     ) -> Reply {
         let selector = (setup.value >> 8) as u8;
         let interface = (setup.index & 0xff) as u8;
@@ -337,7 +359,7 @@ impl UvcDevice {
                 let sizes = UvcDevice::commit_sizes(transfer, length, is_device_to_host);
                 let streaming =
                     matches!(sizes, Some((frame, payload)) if frame != 0 && payload != 0);
-                camera::set_streaming(streaming);
+                camera::set_streaming(camera_slot, streaming);
                 let mut stream = stream.lock();
                 stream.committed = streaming;
                 stream.restart();
@@ -463,6 +485,7 @@ impl UvcDevice {
     fn handle_bulk_in(
         transfer: &mut UvcTransfer,
         stream: &Arc<Mutex<StreamState>>,
+        camera_slot: usize,
     ) -> BackendResult<()> {
         transfer.actual_length = 0;
         let buffer_len = match &transfer.buffer {
@@ -473,7 +496,7 @@ impl UvcDevice {
             return Ok(());
         }
 
-        camera::touch_activity();
+        camera::touch_activity(camera_slot);
         let mut stream = stream.lock();
         if !stream.committed {
             // The guest has not committed a stream yet: answer with a short
@@ -487,7 +510,7 @@ impl UvcDevice {
             // the host asks would flood the bus with copies and starve the real
             // frames. Without a new picture the transfer completes empty, which
             // makes the host wait instead of spinning.
-            match camera::take_latest_frame() {
+            match camera::take_latest_frame(camera_slot) {
                 Some((seq, live)) if seq != stream.frame_seq => {
                     stream.frame = live;
                     stream.frame_seq = seq;
@@ -578,7 +601,7 @@ impl UvcDevice {
         // starts it. The commit control is the authoritative signal, but this
         // keeps the camera closed when the host switches away without one.
         if alt == 0 {
-            camera::set_streaming(false);
+            camera::set_streaming(self.camera_slot, false);
         }
         let mut stream = self.stream.lock();
         stream.alt_setting = alt;
@@ -589,7 +612,7 @@ impl UvcDevice {
 
     /// Drops any stream the guest may be running.
     fn stop_stream(&self) {
-        camera::set_streaming(false);
+        camera::set_streaming(self.camera_slot, false);
         let mut stream = self.stream.lock();
         stream.committed = false;
         stream.restart();
@@ -615,6 +638,7 @@ impl BackendDevice for UvcDevice {
 
         let endpoint = transfer.endpoint;
         let stream = self.stream.clone();
+        let camera_slot = self.camera_slot;
         let arc_transfer = Arc::new(Mutex::new(Some(transfer)));
         let cancel_handle = UvcTransferHandle {
             weak_transfer: Arc::downgrade(&arc_transfer),
@@ -633,11 +657,11 @@ impl BackendDevice for UvcDevice {
                 drop(lock);
 
                 let result = if endpoint == 0 {
-                    UvcDevice::handle_control(&mut transfer, &stream)
+                    UvcDevice::handle_control(&mut transfer, &stream, camera_slot)
                 } else if endpoint == descriptors::STATUS_ENDPOINT {
                     UvcDevice::handle_status_in(&mut transfer, &stream)
                 } else {
-                    UvcDevice::handle_bulk_in(&mut transfer, &stream)
+                    UvcDevice::handle_bulk_in(&mut transfer, &stream, camera_slot)
                 };
                 if let Err(e) = result {
                     error!("uvc: endpoint {endpoint} transfer failed: {e:#}");
@@ -740,7 +764,7 @@ impl BackendDevice for UvcDevice {
     }
 
     fn get_device_descriptor_tree(&mut self) -> BackendResult<DeviceDescriptorTree> {
-        let mut descbuf = descriptors::DEVICE_DESCRIPTOR.to_vec();
+        let mut descbuf = descriptors::device_descriptor(self.camera_slot).to_vec();
         descbuf.extend_from_slice(&descriptors::config_descriptor());
         parse_usbfs_descriptors(&descbuf).map_err(BackendError::GetDeviceDescriptor)
     }
@@ -837,8 +861,10 @@ impl XhciBackendDevice for UvcDevice {
 pub fn attach_virtual_camera(
     device_state: DeviceState,
     event_loop: Arc<EventLoop>,
+    camera_slot: usize,
+    camera_id: String,
 ) -> BackendResult<Arc<Mutex<BackendDeviceType>>> {
-    let device = UvcDevice::new(device_state, event_loop)?;
+    let device = UvcDevice::new(device_state, event_loop, camera_slot, camera_id)?;
     Ok(Arc::new(Mutex::new(BackendDeviceType::UvcDevice(device))))
 }
 
