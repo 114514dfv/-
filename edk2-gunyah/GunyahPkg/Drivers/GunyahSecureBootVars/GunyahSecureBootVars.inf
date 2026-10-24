@@ -1,0 +1,59 @@
+## @file
+#  Gunyah Secure Boot state publisher and PCR7 authority measurer.
+#
+#  Publishes "SetupMode" and "SecureBoot" from the values crosvm puts in the
+#  "droidvm,secureboot" device tree node, which is what a UEFI platform with
+#  Secure Boot enabled reports, and appends the EV_EFI_VARIABLE_AUTHORITY
+#  measurement of the db entry that authenticates the Windows boot manager.
+#  Windows uses the variables to decide whether the firmware is Secure Boot
+#  capable (msinfo32 "Secure Boot state"), uses the whole PCR7 event sequence
+#  to decide whether PCR7 can be bound, and refuses the TPM path of BitLocker
+#  with FVE_E_NO_TPM_BIOS (0x80310002) or logs event 893 ("TCG log is invalid
+#  for use of Secure Boot") when either is missing.  No node means no
+#  variables: the policy lives in the VMM, not in this image.
+#
+#  Enabling verification would be fatal here: the DXE images on this platform
+#  are unsigned, so image verification would reject every driver loaded after
+#  this one.  The platform links the do-nothing SecurityStubDxe and
+#  AuthVariableLibNull, so the published state is not enforced by anybody.
+#
+#  Copyright (c) 2026. SPDX-License-Identifier: BSD-2-Clause-Patent
+##
+
+[Defines]
+  INF_VERSION                    = 1.29
+  BASE_NAME                      = GunyahSecureBootVars
+  FILE_GUID                      = 3C6E1D92-5B47-4A0E-9F31-8E2C7A5B4D10
+  MODULE_TYPE                    = DXE_DRIVER
+  VERSION_STRING                 = 1.0
+  ENTRY_POINT                    = GunyahSecureBootVarsEntry
+
+[Sources]
+  GunyahSecureBootVars.c
+
+[Packages]
+  MdePkg/MdePkg.dec
+  MdeModulePkg/MdeModulePkg.dec
+  EmbeddedPkg/EmbeddedPkg.dec
+
+[LibraryClasses]
+  BaseLib
+  BaseMemoryLib
+  DebugLib
+  MemoryAllocationLib
+  UefiBootServicesTableLib
+  UefiDriverEntryPoint
+  UefiRuntimeServicesTableLib
+
+[Guids]
+  gEfiCertX509Guid
+  gEfiEventReadyToBootGuid
+  gEfiGlobalVariableGuid
+  gEfiImageSecurityDatabaseGuid
+
+[Protocols]
+  gEfiTcg2ProtocolGuid
+  gFdtClientProtocolGuid
+
+[Depex]
+  gEfiVariableArchProtocolGuid AND gEfiVariableWriteArchProtocolGuid AND gFdtClientProtocolGuid

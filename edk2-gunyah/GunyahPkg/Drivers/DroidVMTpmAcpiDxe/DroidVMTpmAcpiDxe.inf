@@ -1,0 +1,65 @@
+## @file
+#  DroidVM virtual TPM 2.0 ACPI publisher.
+#
+#  Builds a TPM2 ACPI table with StartMethod = TIS, and publishes the SSDT built
+#  from TpmAcpi.asl (packed into the firmware volume as a raw section) declaring
+#  the \_SB.TPM0 device with _HID "MSFT0101" that Windows' inbox tpm.sys binds
+#  to. crosvm's TIS MMIO base is patched over the placeholder the ASL was
+#  compiled with.
+#
+#  The FdtClient dependency is not optional: the address comes from the device
+#  tree, so this must not run before the tree is available.
+#
+#  Copyright (c) 2026. SPDX-License-Identifier: BSD-2-Clause-Patent
+##
+
+[Defines]
+  INF_VERSION                    = 0x00010005
+  BASE_NAME                      = DroidVMTpmAcpiDxe
+  FILE_GUID                      = 7A3E5C41-9B62-4D18-8F04-2CE6B71D5A93
+  MODULE_TYPE                    = DXE_DRIVER
+  VERSION_STRING                 = 1.0
+  ENTRY_POINT                    = DroidVMTpmAcpiDxeEntryPoint
+
+[Sources]
+  DroidVMTpmAcpiDxe.c
+  TpmAcpi.asl
+
+[Packages]
+  EmbeddedPkg/EmbeddedPkg.dec
+  MdePkg/MdePkg.dec
+  SecurityPkg/SecurityPkg.dec
+
+[LibraryClasses]
+  BaseLib
+  BaseMemoryLib
+  DebugLib
+  DxeServicesLib
+  MemoryAllocationLib
+  PcdLib
+  UefiBootServicesTableLib
+  UefiDriverEntryPoint
+
+#
+# gEfiAcpiTableProtocolGuid is declared by MdePkg.dec (Include/Protocol/
+# AcpiTable.h lives under MdePkg), not by MdeModulePkg.
+#
+[Protocols]
+  gEfiAcpiTableProtocolGuid
+  gFdtClientProtocolGuid
+
+#
+# The TCG2 event log Tcg2Dxe would allocate, copied into the TPM2 ACPI table as
+# LAML/LASA. This firmware carries no TCG2 stack (no Tcg2Dxe, no PEI
+# measurement), so both PCDs keep their zero defaults and the table is published
+# with an empty log: Windows still binds tpm.sys to the device and measures into
+# the TPM itself, it just has no firmware event log to replay. The dependency on
+# the TCG2 protocol that used to sit in the depex below is dropped for the same
+# reason -- with it, the driver never dispatched at all.
+#
+[Pcd]
+  gEfiSecurityPkgTokenSpaceGuid.PcdTpm2AcpiTableLaml
+  gEfiSecurityPkgTokenSpaceGuid.PcdTpm2AcpiTableLasa
+
+[Depex]
+  gEfiAcpiTableProtocolGuid AND gFdtClientProtocolGuid AND gEfiTcg2ProtocolGuid
